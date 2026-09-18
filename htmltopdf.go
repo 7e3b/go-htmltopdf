@@ -87,4 +87,3 @@ func (q *queue) close() {
 	q.mu.Unlock()
 	q.wg.Wait()
 }
-
