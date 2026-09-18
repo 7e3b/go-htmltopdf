@@ -2,88 +2,168 @@ package htmltopdf
 
 import (
 	"context"
+	"fmt"
 	"sync"
+
+	"github.com/7e3b/go-queue"
+	"github.com/chromedp/cdproto/page"
+	"github.com/chromedp/chromedp"
 )
 
-type queue struct {
+type Client interface {
+	Convert(context.Context, string) ([]byte, error)
+	Close()
+}
+
+func New(workers int) (Client, error) {
+	c, err := newClient(workers)
+	if err != nil {
+		err = fmt.Errorf("newClient: %w", err)
+		return nil, err
+	}
+	return c, nil
+}
+
+type client struct {
 	ctx    context.Context
 	cancel context.CancelFunc
-	mu     *sync.Mutex
-	store  []string
-	sigCh  chan struct{}
-	subCh  chan string
+	queue  queue.Queue[*element]
 	wg     *sync.WaitGroup
 }
 
-func newQueue() *queue {
+func newClient(workers int) (*client, error) {
 	ctx, cancel := context.WithCancel(context.Background())
-	q := &queue{
+	c := &client{
 		ctx:    ctx,
 		cancel: cancel,
-		mu:     &sync.Mutex{},
-		store:  []string{},
-		sigCh:  make(chan struct{}, 1),
-		subCh:  make(chan string),
+		queue:  queue.New[*element](),
 		wg:     &sync.WaitGroup{},
 	}
-	q.wg.Add(1)
-	go q.loop()
-	return q
-}
-
-func (q *queue) push(input string) error {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	err := q.ctx.Err()
+	allocatorCtx, _ := chromedp.NewExecAllocator(
+		ctx,
+		chromedp.NoFirstRun,
+		chromedp.NoDefaultBrowserCheck,
+		chromedp.Headless,
+		chromedp.DisableGPU,
+	)
+	browserCtx, _ := chromedp.NewContext(allocatorCtx)
+	err := chromedp.Run(browserCtx)
 	if err != nil {
-		return err
+		err = fmt.Errorf("chromedp.Run: %w", err)
+		return nil, err
 	}
-	q.store = append(q.store, input)
-	select {
-	case q.sigCh <- struct{}{}:
-	default:
+	for range workers {
+		c.wg.Add(1)
+		tabCtx, _ := chromedp.NewContext(browserCtx)
+		tab := &tab{
+			wg:    c.wg,
+			ctx:   tabCtx,
+			queue: c.queue,
+		}
+		go tab.loop()
 	}
-	return nil
+	return c, nil
 }
 
-func (q *queue) loop() {
-	defer q.wg.Done()
+type tab struct {
+	wg    *sync.WaitGroup
+	ctx   context.Context
+	queue queue.Queue[*element]
+}
+
+func (t *tab) loop() {
+	defer t.wg.Done()
 	for {
 		select {
-		case <-q.ctx.Done():
+		case <-t.ctx.Done():
 			return
-		case <-q.sigCh:
-			q.mu.Lock()
-			if len(q.store) == 0 {
-				q.mu.Unlock()
-				continue
+		case element, ok := <-t.queue.Pop():
+			if !ok {
+				return
 			}
-			values := q.store
-			q.store = []string{}
-			q.mu.Unlock()
-			for _, value := range values {
-				select {
-				case <-q.ctx.Done():
-					return
-				case q.subCh <- value:
+			select {
+			case <-element.ctx.Done():
+				err := fmt.Errorf("element.ctx.Err: %w", element.ctx.Err())
+				element.err = err
+				close(element.ch)
+				continue
+			default:
+				output, err := t.convert(element)
+				if err != nil {
+					err = fmt.Errorf("t.convert: %w", err)
+					element.err = err
+				} else {
+					element.output = output
 				}
+				close(element.ch)
 			}
 		}
 	}
 }
 
-func (q *queue) pop() (string, error) {
-	select {
-	case <-q.ctx.Done():
-		return "", q.ctx.Err()
-	case value := <-q.subCh:
-		return value, nil
+func (t *tab) convert(e *element) ([]byte, error) {
+	var output []byte
+	err := chromedp.Run(
+		t.ctx,
+		chromedp.Navigate(e.url),
+		chromedp.ActionFunc(
+			func(ctx context.Context) error {
+				params := page.PrintToPDF()
+				params = params.WithPrintBackground(true)
+				var err error
+				output, _, err = params.Do(ctx)
+				if err != nil {
+					err = fmt.Errorf("params.Do: %w", err)
+					return err
+				}
+				return nil
+			},
+		),
+	)
+	if err != nil {
+		err = fmt.Errorf("chromedp.Run: %w", err)
+		return nil, err
 	}
+	return output, nil
 }
 
-func (q *queue) close() {
-	q.mu.Lock()
-	q.cancel()
-	q.mu.Unlock()
-	q.wg.Wait()
+func (c *client) Close() {
+	c.cancel()
+	c.queue.Close()
+	c.wg.Wait()
+}
+
+type element struct {
+	ctx    context.Context
+	url    string
+	ch     chan struct{}
+	err    error
+	output []byte
+}
+
+func (c *client) Convert(ctx context.Context, url string) ([]byte, error) {
+	e := &element{
+		ctx: ctx,
+		url: url,
+		ch:  make(chan struct{}),
+	}
+	err := c.queue.Push(e)
+	if err != nil {
+		err = fmt.Errorf("c.queue.Push: %w", err)
+		return nil, err
+	}
+	select {
+	case <-c.ctx.Done():
+		err = fmt.Errorf("c.ctx.Err: %w", c.ctx.Err())
+		return nil, err
+	case <-ctx.Done():
+		err = fmt.Errorf("ctx.Err: %w", ctx.Err())
+		return nil, err
+	case <-e.ch:
+		if e.err != nil {
+			err = fmt.Errorf("e.err: %w", e.err)
+			return nil, err
+		}
+		return e.output, nil
+	}
 }
