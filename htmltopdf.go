@@ -10,11 +10,33 @@ import (
 	"github.com/chromedp/chromedp"
 )
 
+// Client converts HTML pages to PDF documents using a pool of headless
+// Chromium tabs.
+//
+// A Client is safe for concurrent use. Each conversion is processed by one
+// of the configured worker tabs.
+//
+// Call Close when the Client is no longer needed.
 type Client interface {
+	// Convert navigates to url and returns the resulting page as a PDF.
+	//
+	// Convert blocks until the conversion completes, the provided context is
+	// cancelled, or the client is closed.
 	Convert(context.Context, string) ([]byte, error)
+
+	// Close stops all workers and releases the resources owned by the client.
+	//
+	// Close waits for in-progress conversions to finish before returning.
 	Close()
 }
 
+// New creates a Client with workers concurrent Chromium tabs.
+//
+// Each worker processes one PDF conversion at a time. Increasing workers
+// allows multiple conversions to run concurrently, at the cost of additional
+// Chromium resources.
+//
+// New returns an error if the Chromium browser cannot be initialized.
 func New(workers int) (Client, error) {
 	c, err := newClient(workers)
 	if err != nil {
